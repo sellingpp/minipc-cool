@@ -1,5 +1,5 @@
 ﻿<#
-  미니PC 발열 관리 v1.0 - Firebat F1 (Ryzen 5 7640HS / Ryzen 7 H 255)
+  미니PC 발열 관리 v1.0.1 - Firebat F1 (Ryzen 5 7640HS / Ryzen 7 H 255)
   MIT License (LICENSE.txt). Firebat 공식 프로그램이 아니며, 사용에 따른 책임은 사용자에게 있다.
 
   미니PC 발열을 줄이는 윈도우 전원 설정을 버튼 하나로 적용한다.
@@ -23,7 +23,7 @@ $ErrorActionPreference = 'Stop'
 $ScriptPath = $MyInvocation.MyCommand.Path
 $AppDir = Split-Path -Parent $ScriptPath
 $AppName = '미니PC 발열관리'   # 전원 계획·바로가기 이름에도 쓰므로 버전은 넣지 않는다
-$AppVersion = 'v1.0'
+$AppVersion = 'v1.0.1'
 $Disclaimer = 'Firebat 공식 프로그램이 아니에요. 있는 그대로 제공되며, 사용에 따른 책임은 사용자에게 있어요.'
 
 function Test-Admin {
@@ -263,17 +263,18 @@ $LiveReader = {
 
 function Start-LiveReader {
     $script:Live = [hashtable]::Synchronized(@{ Stop = $false; MHz = $null; Util = $null; Disks = $null; Zones = $null })
-    $rs = [runspacefactory]::CreateRunspace()
+    # 읽기 함수(Read-LiveValues)를 백그라운드 쪽에 함수로 등록해 두고 부른다
+    $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry('Read-LiveValues', $LiveReader.ToString())))
+    $rs = [runspacefactory]::CreateRunspace($iss)
     $rs.Open()
     $rs.SessionStateProxy.SetVariable('Live', $script:Live)
-    $rs.SessionStateProxy.SetVariable('ReaderText', $LiveReader.ToString())
     $ps = [powershell]::Create()
     $ps.Runspace = $rs
     [void]$ps.AddScript({
-        $read = [scriptblock]::Create($ReaderText)
         $n = 0
         while (-not $Live.Stop) {
-            $v = & $read ($n % 5 -eq 0)   # CPU는 2초마다, 디스크·온도는 10초마다
+            $v = Read-LiveValues ($n % 5 -eq 0)   # CPU는 2초마다, 디스크·온도는 10초마다
             $Live.MHz = $v.MHz; $Live.Util = $v.Util
             if ($null -ne $v.Disks) { $Live.Disks = $v.Disks; $Live.Zones = $v.Zones }
             $n++

@@ -41,11 +41,12 @@ F1이 아닌 컴퓨터에서도 켜지고 동작하지만, 그 CPU에 맞는 값
 릴리스마다 zip의 SHA-256 값을 함께 올립니다. 받은 파일이 바뀌지 않았는지 PowerShell에서 확인할 수 있습니다.
 
 ```powershell
-Get-FileHash .\MiniPC-Cool_v1.0.zip -Algorithm SHA256
+Get-FileHash .\MiniPC-Cool.zip -Algorithm SHA256
 ```
 
 ## 변경 기록
 
+- v1.0.1 (2026-11-21): 실시간 값 읽는 방식을 정리(일부 백신의 추정 탐지 대응), 받는 파일 이름을 MiniPC-Cool.zip 으로 고정
 - v1.0 (2026-11-20): 첫 배포
 
 ## 라이선스
