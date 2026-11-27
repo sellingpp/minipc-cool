@@ -1,30 +1,44 @@
 ﻿<#
-  미니PC 발열 관리 v1.0.1 - Firebat F1 (Ryzen 5 7640HS / Ryzen 7 H 255)
+  미니PC 발열관리 v1.1 - Firebat F1 (Ryzen 5 7640HS / Ryzen 7 H 255)
   MIT License (LICENSE.txt). Firebat 공식 프로그램이 아니며, 사용에 따른 책임은 사용자에게 있다.
 
-  미니PC 발열을 줄이는 윈도우 전원 설정을 버튼 하나로 적용한다.
-  - 윈도우 전원 계획만 바꾼다(드라이버·외부 프로그램 없음). '원래대로'로 언제든 되돌린다.
-  - 전력 제한(W)은 바이오스에서 거는 게 확실해서 방법 안내와 '바이오스로 재부팅' 버튼만 둔다.
+  미니PC 발열을 줄이는 윈도우 전원 설정을 버튼 하나로 적용한다. 방법은 두 가지.
+  - 부스트 끄기 (99%)  : 부스트를 끄고 최대 프로세서 상태 99% → 기본 클럭 근처까지만
+  - 최대 클럭 제한     : 최대 프로세서 주파수(MHz)만 낮춘다. 값은 직접 정할 수 있다
+  윈도우 전원 계획만 바꾼다(드라이버·외부 프로그램 없음). '원래대로'로 언제든 되돌린다.
+  전력 제한(W)은 바이오스에서 거는 게 확실해서 방법 안내와 '바이오스로 재부팅' 버튼만 둔다.
 
   사용: 같은 폴더의 '발열관리 실행.bat' 더블클릭
-  시험: powershell -ExecutionPolicy Bypass -File MiniPC-Cool.ps1 -DryRun -RunAction recommend
-        (실제로 바꾸지 않고 실행할 명령만 출력)
-  명령줄: -RunAction recommend | quiet | game | restore | status
+  명령줄(관리자 PowerShell): -RunAction boostoff | quiet | base | game | clock -Clock <MHz> | restore | status
+  시험: -DryRun 을 붙이면 실제로 바꾸지 않고 실행할 명령만 출력한다
 #>
 param(
     [switch]$DryRun,
-    [ValidateSet('', 'recommend', 'quiet', 'game', 'restore', 'status')]
+    [ValidateSet('', 'boostoff', 'recommend', 'quiet', 'base', 'game', 'clock', 'restore', 'status')]
     [string]$RunAction = '',
-    [string]$Snapshot = '',
-    [string]$FakeCpu = ''   # 시험용: 다른 PC에서 F1 화면을 미리 볼 때 CPU 이름을 대신 넣는다
+    [int]$Clock = 0,            # -RunAction clock 일 때 최대 클럭(MHz)
+    [switch]$Elevated,          # 내부용: 관리자 권한으로 다시 띄운 창임을 표시
+    [string]$UserDesktop = '',  # 내부용: 처음 실행한 사용자의 바탕화면 경로
+    [string]$Snapshot = '',     # 시험용: 화면을 그림 파일로 저장하고 끝낸다
+    [string]$FakeCpu = ''       # 시험용: 다른 PC에서 F1 화면을 미리 볼 때 CPU 이름을 대신 넣는다
 )
 
 $ErrorActionPreference = 'Stop'
+# 숫자 표기를 윈도우 언어·지역 설정과 상관없이 같게 한다(4,600 MHz, 4.3GHz)
+try { [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::InvariantCulture } catch { }
 $ScriptPath = $MyInvocation.MyCommand.Path
 $AppDir = Split-Path -Parent $ScriptPath
 $AppName = '미니PC 발열관리'   # 전원 계획·바로가기 이름에도 쓰므로 버전은 넣지 않는다
-$AppVersion = 'v1.0.1'
+$AppVersion = 'v1.1'
 $Disclaimer = 'Firebat 공식 프로그램이 아니에요. 있는 그대로 제공되며, 사용에 따른 책임은 사용자에게 있어요.'
+
+# 관리자 권한으로 도는 프로그램이라 윈도우에 들어 있는 실행 파일은 경로째로 부른다
+$SysDir = Join-Path $env:SystemRoot 'System32'
+$PowerCfgExe = Join-Path $SysDir 'powercfg.exe'
+$ShutdownExe = Join-Path $SysDir 'shutdown.exe'
+$NotepadExe = Join-Path $SysDir 'notepad.exe'
+$PsExe = Join-Path $SysDir 'WindowsPowerShell\v1.0\powershell.exe'
+if (-not (Test-Path -LiteralPath $PsExe)) { $PsExe = Join-Path $PSHOME 'powershell.exe' }
 
 function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -33,33 +47,68 @@ function Test-Admin {
 
 # ---------- 관리자 권한으로 다시 실행 ----------
 if (-not (Test-Admin) -and -not $DryRun -and -not $Snapshot -and $RunAction -ne 'status') {
-    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', "`"$ScriptPath`"")
-    if ($RunAction) { $argList += @('-RunAction', $RunAction) }
+    if ($RunAction) {
+        # 명령줄에서는 숨은 창으로 넘기지 않는다(결과가 안 보이게 되므로)
+        Write-Host '전원 설정을 바꾸려면 관리자 PowerShell에서 실행해 주세요. (-DryRun 을 붙이면 바꾸지 않고 명령만 볼 수 있어요)'
+        exit 1
+    }
+    Add-Type -AssemblyName System.Windows.Forms
+    if ($Elevated) {
+        # 관리자 권한으로 다시 띄웠는데도 관리자가 아니면 계속 되풀이하지 않고 멈춘다
+        [void][System.Windows.Forms.MessageBox]::Show("관리자 권한을 얻지 못했어요.`n관리자 계정으로 로그인한 뒤 다시 실행해 주세요.", $AppName)
+        exit 1
+    }
+    # 네트워크 위치(공유 폴더, 네트워크 드라이브)에 있으면 관리자 권한 쪽에서 파일을 찾지 못할 수 있다
+    $onNetwork = $false
     try {
-        Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $argList | Out-Null
+        $root = [System.IO.Path]::GetPathRoot($ScriptPath)
+        if ($root -and $root.StartsWith('\\')) { $onNetwork = $true }
+        elseif ($root) { $onNetwork = ((New-Object System.IO.DriveInfo($root)).DriveType -eq [System.IO.DriveType]::Network) }
+    } catch { }
+    if ($onNetwork) {
+        [void][System.Windows.Forms.MessageBox]::Show("네트워크 위치에서는 실행할 수 없어요.`n폴더를 이 PC(바탕화면 등)로 복사한 뒤 다시 실행해 주세요.", $AppName)
+        exit 1
+    }
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', "`"$ScriptPath`"", '-Elevated')
+    # 바로가기는 처음 실행한 사용자의 바탕화면에 만들어야 하므로 그 경로를 넘긴다
+    $desk = ''
+    try { $desk = ([Environment]::GetFolderPath('Desktop')).TrimEnd('\') } catch { }
+    if ($desk -and $desk -notmatch '"') { $argList += @('-UserDesktop', "`"$desk`"") }
+    try {
+        Start-Process -FilePath $PsExe -Verb RunAs -ArgumentList $argList | Out-Null
     } catch {
-        Add-Type -AssemblyName System.Windows.Forms
         [void][System.Windows.Forms.MessageBox]::Show('관리자 권한을 허용해야 전원 설정을 바꿀 수 있어요.', $AppName)
     }
     exit
 }
 
 # ---------- 상수 ----------
-$GUID_BALANCED = '381b4222-f694-41f0-9685-ff5bb260df2e'   # 윈도우 기본 '균형 조정'
 $GUID_MINE     = 'f1c0011e-7640-4255-a1c3-0d1ce0c0ffee'   # 이 프로그램이 만드는 전원 계획
+$GUID_BALANCED = '381b4222-f694-41f0-9685-ff5bb260df2e'   # 윈도우 기본 '균형 조정'
 $SUB_PROCESSOR = '54533251-82be-4824-96c1-47b60b740d00'   # 프로세서 전원 관리
 $S_BOOST       = 'be337238-0d82-4146-a960-4f3749d470c7'   # 프로세서 성능 강화 모드(숨김 항목)
 $S_MAXSTATE    = 'bc5038f7-23e0-4960-96da-33abaf5935ec'   # 최대 프로세서 상태(%)
 $S_MAXFREQ     = '75b0ae3f-bce0-45a7-8c89-c9611c25e100'   # 최대 프로세서 주파수(MHz, 숨김 항목)
-$StateDir  = Join-Path $env:ProgramData 'MiniPCCool'
-$StateFile = Join-Path $StateDir 'previous-scheme.txt'
+$S_MINSTATE    = '893dee8e-2bef-41e0-89c6-b55d0929964c'   # 최소 프로세서 상태(%)
+# 코어 종류가 여럿인 CPU(성능·효율 코어)에는 같은 항목이 코어 등급별로 따로 있다(등급 1, 2)
+$S_MAXSTATE_MORE = @('bc5038f7-23e0-4960-96da-33abaf5935ed', 'bc5038f7-23e0-4960-96da-33abaf5935ee')
+$S_MAXFREQ_MORE  = @('75b0ae3f-bce0-45a7-8c89-c9611c25e101', '75b0ae3f-bce0-45a7-8c89-c9611c25e102')
+$S_MINSTATE_MORE = @('893dee8e-2bef-41e0-89c6-b55d0929964d', '893dee8e-2bef-41e0-89c6-b55d0929964e')
+$BOOST_OFF = 0   # 사용 안 함
+$BOOST_ON  = 1   # 사용 - 부스트를 쓰되 윈도우가 정한 상한(최대 주파수)을 지키는 방식
 $GuidRx = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+# 되돌릴 때 쓸 '이전 전원 계획'을 기억해 두는 곳(관리자만 쓸 수 있는 레지스트리)
+$StateKey = 'HKLM:\SOFTWARE\MiniPCCool'
+# 예전 버전(v1.0)이 기억해 두던 파일. 읽기만 하고, 되돌릴 때 치운다
+$LegacyStateDir  = Join-Path $env:ProgramData 'MiniPCCool'
+$LegacyStateFile = Join-Path $LegacyStateDir 'previous-scheme.txt'
 
 $BoostNames = @{
     0 = '사용 안 함'; 1 = '사용'; 2 = '적극적(윈도우 기본)'; 3 = '효율적으로 활성화됨'
     4 = '적극적으로 효율화됨'; 5 = '보장될 때 적극적'; 6 = '보장될 때 적극적으로 효율화됨'
 }
 $script:Log = New-Object System.Collections.Generic.List[string]
+$script:LastSetError = ''
 
 # ---------- powercfg ----------
 function Invoke-PowerCfg {
@@ -68,7 +117,7 @@ function Invoke-PowerCfg {
     if ($Change -and $DryRun) { return @() }
     $old = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    try { $out = & powercfg.exe @A 2>&1 } finally { $ErrorActionPreference = $old }
+    try { $out = & $PowerCfgExe @A 2>&1 } finally { $ErrorActionPreference = $old }
     if ($LASTEXITCODE -ne 0) { throw ("powercfg {0} 실패: {1}" -f ($A -join ' '), (($out | ForEach-Object { "$_" }) -join ' ')) }
     return $out
 }
@@ -110,91 +159,197 @@ function Get-CurrentState {
         Guid = $active; Name = $name; IsMine = ($active -eq $GUID_MINE)
         Boost = $(if ($b) { [int]$b.AC } else { -1 })
         MaxState = $(if ($m) { [int]$m.AC } else { -1 })
-        MaxFreq = $(if ($f) { [int]$f.AC } else { 0 })
+        MaxFreq = $(if ($f -and $f.AC -le 100000) { [int]$f.AC } else { 0 })
     }
 }
 
-# ---------- CPU·프로필 ----------
+# ---------- 이전 전원 계획 기억 ----------
+function Save-PreviousScheme([string]$guid) {
+    if (-not (Test-Path -LiteralPath $StateKey)) { New-Item -Path $StateKey -Force | Out-Null }
+    New-ItemProperty -LiteralPath $StateKey -Name 'PreviousScheme' -Value $guid -PropertyType String -Force | Out-Null
+}
+
+# 기억해 둔 계획의 GUID. 없거나 GUID 모양이 아니면 $null.
+function Get-PreviousScheme {
+    $v = $null
+    try { $v = (Get-ItemProperty -LiteralPath $StateKey -Name 'PreviousScheme' -ErrorAction Stop).PreviousScheme } catch { }
+    if (-not $v) {
+        try { if (Test-Path -LiteralPath $LegacyStateFile) { $v = Get-Content -LiteralPath $LegacyStateFile -Raw -ErrorAction Stop } } catch { }
+    }
+    if (-not $v) { return $null }
+    $v = "$v".Trim().ToLower()
+    if ($v -notmatch "^$GuidRx$") { return $null }
+    return $v
+}
+
+function Clear-PreviousScheme {
+    try { if (Test-Path -LiteralPath $StateKey) { Remove-Item -LiteralPath $StateKey -Recurse -Force } } catch { }
+    # 예전 버전이 남긴 파일·폴더도 치운다. 다른 곳으로 이어진 폴더(링크)면 건드리지 않는다.
+    try {
+        if (Test-Path -LiteralPath $LegacyStateDir) {
+            $d = Get-Item -LiteralPath $LegacyStateDir -Force
+            if (-not ($d.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                if (Test-Path -LiteralPath $LegacyStateFile) { Remove-Item -LiteralPath $LegacyStateFile -Force }
+                if (-not (Get-ChildItem -LiteralPath $LegacyStateDir -Force)) { Remove-Item -LiteralPath $LegacyStateDir -Force }
+            }
+        }
+    } catch { }
+}
+
+# ---------- CPU ----------
 function Get-CpuInfo {
-    $p = Get-CimInstance Win32_Processor | Select-Object -First 1
-    $name = ($p.Name -replace '\s+', ' ').Trim()
+    $name = ''; $mhz = 0
+    try {
+        $p = Get-CimInstance Win32_Processor -Property Name, MaxClockSpeed -ErrorAction Stop | Select-Object -First 1
+        $name = ("$($p.Name)" -replace '\s+', ' ').Trim()
+        $mhz = [int]$p.MaxClockSpeed
+    } catch { }
     if ($FakeCpu) { $name = $FakeCpu }
-    $info = [ordered]@{ Name = $name; Model = 'other'; Label = $name; Base = [int]$p.MaxClockSpeed; Boost = 0; GameCap = 0 }
-    if ($name -match '7640HS') {
-        $info.Model = '7640HS'; $info.Label = 'Ryzen 5 7640HS (6코어)'
-        $info.Base = 4300; $info.Boost = 5000; $info.GameCap = 4600
-    } elseif ($name -match 'H ?255') {
-        $info.Model = 'H255'; $info.Label = 'Ryzen 7 H 255 (8코어)'
-        $info.Base = 3800; $info.Boost = 4900; $info.GameCap = 4400
+    if (-not $name) { $name = '알 수 없는 CPU' }
+    if ($name -match 'Ryzen.*\b7640HS\b') {
+        return [pscustomobject]@{ Name = $name; Model = '7640HS'; Label = 'Ryzen 5 7640HS (6코어)'
+            Base = 4300; Boost = 5000; Quiet = 3400; Game = 4600; Min = 2000; Max = 5000 }
     }
-    return [pscustomobject]$info
+    if ($name -match 'Ryzen.*\bH ?255\b') {
+        return [pscustomobject]@{ Name = $name; Model = 'H255'; Label = 'Ryzen 7 H 255 (8코어)'
+            Base = 3800; Boost = 4900; Quiet = 3000; Game = 4400; Min = 2000; Max = 4900 }
+    }
+    # 그 밖의 CPU: 윈도우가 알려 주는 기본 클럭을 그대로 쓴다. 모르면 0(부스트 최대값은 알 수 없음).
+    $base = 0
+    if ($mhz -ge 400 -and $mhz -le 6000) { $base = [int]([math]::Round($mhz / 100.0) * 100) }
+    # 빠른 선택 값은 기본 클럭이 충분히 높을 때만 만든다(낮은 CPU에서 엉뚱하게 느려지지 않게)
+    $quiet = 0
+    if ($base -ge 2000) { $quiet = [int]([math]::Round($base * 0.8 / 100.0) * 100) }
+    return [pscustomobject]@{ Name = $name; Model = 'other'; Label = $name
+        Base = $base; Boost = 0; Quiet = $quiet; Game = 0; Min = 1000; Max = 6000 }
 }
 
-function Get-Profiles($cpu) {
-    $baseG = '{0:0.0}' -f ($cpu.Base / 1000)
-    # 설명 글은 단어 중간에서 줄이 바뀌지 않게 줄바꿈 위치를 직접 정한다
-    $gameDesc = if ($cpu.GameCap -gt 0) {
-        "부스트는 켜되 최대 {0:0.0}GHz로 묶어요(원래 {1:0.0}GHz).`r`n게임·무거운 작업용." -f ($cpu.GameCap / 1000), ($cpu.Boost / 1000)
-    } else { "부스트를 효율 모드로만 켜요.`r`n게임·무거운 작업용." }
-    return [ordered]@{
-        recommend = [pscustomobject]@{ Key = 'recommend'; Title = '추천 · 발열 관리'; Boost = 0; MaxState = 99; MaxFreq = 0
-            Desc = "부스트 끔 + 최대 99% → 기본 클럭(${baseG}GHz)까지만 씁니다.`r`n처음이면 이것부터." }
-        quiet = [pscustomobject]@{ Key = 'quiet'; Title = '조용 · 저발열'; Boost = 0; MaxState = 80; MaxFreq = 0
-            Desc = "부스트 끔 + 최대 80% → 기본 클럭보다 더 낮춰요.`r`n문서·유튜브용, 가장 시원하고 조용함." }
-        game = [pscustomobject]@{ Key = 'game'; Title = '게임 · 성능'; Boost = 3; MaxState = 100; MaxFreq = $cpu.GameCap
-            Desc = $gameDesc }
-    }
+# ---------- 적용할 설정(모드) ----------
+function New-BoostOffMode {
+    return [pscustomobject]@{ Kind = 'boostoff'; Title = '부스트 끄기 (99%)'; Boost = $BOOST_OFF; MaxState = 99; MaxFreq = 0 }
 }
 
-function Find-ProfileMatch($st) {
-    if (-not $st.IsMine) { return $null }
-    foreach ($p in $script:Profiles.Values) {
-        if ($st.Boost -eq $p.Boost -and $st.MaxState -eq $p.MaxState -and $st.MaxFreq -eq $p.MaxFreq) { return $p }
+# 최대 클럭 제한. 기본 클럭 이하면 부스트가 필요 없으니 끄고, 그보다 높으면 부스트를 켜되 상한을 지키게 한다.
+# 기본 클럭을 모르는 CPU에서는 부스트를 끄지 않는다(끄면 기본 클럭에 묶여 정한 값까지 못 올라갈 수 있으므로).
+function New-ClockMode([int]$mhz) {
+    $cpu = $script:Cpu
+    if ($mhz -lt $cpu.Min -or $mhz -gt $cpu.Max) {
+        throw ('최대 클럭은 {0}~{1} MHz 사이로 정해 주세요.' -f $cpu.Min, $cpu.Max)
     }
-    return $null
+    $boost = if ($cpu.Base -gt 0 -and $mhz -le $cpu.Base) { $BOOST_OFF } else { $BOOST_ON }
+    return [pscustomobject]@{ Kind = 'clock'; Title = ('최대 클럭 {0:N0} MHz' -f $mhz); Boost = $boost; MaxState = 100; MaxFreq = $mhz }
+}
+
+# 지금 상태가 어느 모드인지: boostoff / clock / custom(우리 계획인데 값이 다름) / none(우리 계획이 아님)
+function Get-StateMode($st) {
+    if (-not $st.IsMine) { return [pscustomobject]@{ Kind = 'none'; MaxFreq = 0 } }
+    if ($st.MaxFreq -gt 0 -and $st.MaxState -eq 100) { return [pscustomobject]@{ Kind = 'clock'; MaxFreq = $st.MaxFreq } }
+    if ($st.MaxFreq -eq 0 -and $st.Boost -eq $BOOST_OFF -and $st.MaxState -eq 99) { return [pscustomobject]@{ Kind = 'boostoff'; MaxFreq = 0 } }
+    return [pscustomobject]@{ Kind = 'custom'; MaxFreq = $st.MaxFreq }
+}
+
+# 지금 설정으로 CPU가 올라갈 수 있는 클럭 상한(MHz, 대략). 제한이 없거나 알 수 없으면 0.
+function Get-LimitMHz($st) {
+    $base = $script:Cpu.Base
+    $lim = 0
+    if ($base -gt 0 -and ($st.Boost -eq $BOOST_OFF -or ($st.MaxState -ge 1 -and $st.MaxState -le 99))) {
+        $lim = $base
+        if ($st.MaxState -ge 1 -and $st.MaxState -lt 99) { $lim = [int]($base * $st.MaxState / 100) }
+    }
+    if ($st.MaxFreq -gt 0 -and ($lim -eq 0 -or $st.MaxFreq -lt $lim)) { $lim = $st.MaxFreq }
+    return $lim
 }
 
 # ---------- 적용·되돌리기 ----------
-function Set-Profile($p) {
+# 우리 전원 계획의 한 항목을 AC(전원 연결)·DC(배터리) 둘 다 바꾼다. 이 PC에 없는 항목이면 $false.
+function Set-PlanValue([string]$setting, [int]$value) {
+    try {
+        foreach ($cmd in @('/setacvalueindex', '/setdcvalueindex')) {
+            Invoke-PowerCfg -Change @($cmd, $GUID_MINE, $SUB_PROCESSOR, $setting, [string]$value) | Out-Null
+        }
+        return $true
+    } catch {
+        $script:LastSetError = $_.Exception.Message
+        return $false
+    }
+}
+
+function Set-Mode($m) {
     $script:Log.Clear()
     $active = Get-ActiveSchemeGuid
+    $existed = Test-Scheme $GUID_MINE
     if ($active -ne $GUID_MINE) {
-        # 되돌릴 때 쓰려고 지금 쓰던 전원 계획을 기억해 둔다
+        # 되돌릴 때 쓰려고 지금 쓰던 전원 계획을 기억해 둔다(기억하지 못해도 적용은 계속한다)
         if ($DryRun) { $script:Log.Add("(이전 전원 계획 기억: $active)") }
-        else {
-            New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
-            Set-Content -Path $StateFile -Value $active -Encoding ASCII
+        else { try { Save-PreviousScheme $active } catch { $script:Log.Add('(이전 전원 계획을 기억하지 못함 - 되돌릴 때 균형 조정으로 돌아감)') } }
+        if ($existed) {
+            # 우리 계획이 남아 있는데 사용자가 다른 계획을 쓰고 있다면, 옛 복사본은 지우고 지금 계획에서 새로 복사한다.
+            # (그래야 절전·화면 꺼짐 시간 같은 설정이 지금 쓰는 계획과 같아진다)
+            Invoke-PowerCfg -Change @('-delete', $GUID_MINE) | Out-Null
+            $existed = $false
         }
     }
-    if (-not (Test-Scheme $GUID_MINE)) {
-        # 지금 쓰는 계획을 복사한다(절전·화면 꺼짐 시간 같은 사용자의 다른 설정이 그대로 따라오게)
-        $base = $active
-        Invoke-PowerCfg -Change @('-duplicatescheme', $base, $GUID_MINE) | Out-Null
-        Invoke-PowerCfg -Change @('-changename', $GUID_MINE, $AppName, 'Firebat F1 발열 관리 프로그램이 만든 전원 계획') | Out-Null
-    }
-    # 숨김 항목을 제어판에서도 보이게(부스트 모드, 최대 주파수). 실패해도 적용에는 상관없다.
-    foreach ($s in @($S_BOOST, $S_MAXFREQ)) {
-        try { Invoke-PowerCfg -Change @('-attributes', $SUB_PROCESSOR, $s, '-ATTRIB_HIDE') | Out-Null }
-        catch { $script:Log.Add('(제어판 표시 설정은 건너뜀 - 적용에는 상관없음)') }
-    }
-    $vals = [ordered]@{ $S_BOOST = $p.Boost; $S_MAXSTATE = $p.MaxState; $S_MAXFREQ = $p.MaxFreq }
-    foreach ($kv in $vals.GetEnumerator()) {
-        foreach ($cmd in @('/setacvalueindex', '/setdcvalueindex')) {
+    # 이미 우리 계획을 쓰는 중이면, 바꾸다 실패했을 때 되돌려 놓을 처음 값을 적어 둔다
+    $before = $null
+    if ($existed -and -not $DryRun) { try { $before = Get-CurrentState } catch { } }
+    try {
+        if (-not $existed) {
+            Invoke-PowerCfg -Change @('-duplicatescheme', $active, $GUID_MINE) | Out-Null
+            try { Invoke-PowerCfg -Change @('-changename', $GUID_MINE, $AppName, 'Firebat F1 발열 관리 프로그램이 만든 전원 계획') | Out-Null }
+            catch { $script:Log.Add('(전원 계획 이름 바꾸기는 건너뜀 - 적용에는 상관없음)') }
+        }
+        # 숨김 항목을 제어판에서도 보이게(부스트 모드, 최대 주파수). 실패해도 적용에는 상관없다.
+        foreach ($s in @($S_BOOST, $S_MAXFREQ)) {
+            try { Invoke-PowerCfg -Change @('-attributes', $SUB_PROCESSOR, $s, '-ATTRIB_HIDE') | Out-Null }
+            catch { $script:Log.Add('(제어판 표시 설정은 건너뜀 - 적용에는 상관없음)') }
+        }
+        # 최대 주파수부터 바꾼다. 이 항목이 없는 PC에서는 여기서 멈춰서 다른 값이 바뀌지 않는다.
+        $okFreq = Set-PlanValue $S_MAXFREQ $m.MaxFreq
+        if (-not $okFreq -and $m.MaxFreq -gt 0) { throw "이 PC는 최대 클럭 제한을 지원하지 않아요. '부스트 끄기 (99%)'를 써 주세요." }
+        if (-not (Set-PlanValue $S_MAXSTATE $m.MaxState)) { throw ('최대 프로세서 상태를 바꾸지 못했어요. ' + $script:LastSetError) }
+        if (-not (Set-PlanValue $S_BOOST $m.Boost)) { throw ('프로세서 성능 강화 모드를 바꾸지 못했어요. ' + $script:LastSetError) }
+        # 코어 등급별 항목이 따로 있는 PC는 같은 값으로 맞춘다(없으면 넘어감)
+        foreach ($s in $S_MAXFREQ_MORE) { [void](Set-PlanValue $s $m.MaxFreq) }
+        foreach ($s in $S_MAXSTATE_MORE) { [void](Set-PlanValue $s $m.MaxState) }
+        # 최소 프로세서 상태가 높게 잡혀 있으면 쉴 때도 클럭이 안 내려가므로 5%로 낮춘다(이미 낮으면 그대로)
+        $probe = if ($DryRun -and -not $existed) { $active } else { $GUID_MINE }
+        foreach ($s in (@($S_MINSTATE) + $S_MINSTATE_MORE)) {
+            $cur = Get-SettingValue $probe $s
+            if (-not $cur) { continue }
             try {
-                Invoke-PowerCfg -Change @($cmd, $GUID_MINE, $SUB_PROCESSOR, $kv.Key, [string]$kv.Value) | Out-Null
-            } catch {
-                # 최대 주파수 항목이 없는 PC: 제한을 안 거는 설정이면 넘어가고, 거는 설정이면 알린다
-                if ($kv.Key -eq $S_MAXFREQ -and $kv.Value -eq 0) { continue }
-                if ($kv.Key -eq $S_MAXFREQ) { throw '이 PC는 최대 주파수 제한을 지원하지 않아서 게임 모드를 쓸 수 없어요.' }
-                throw
+                if ($cur.AC -gt 5) { Invoke-PowerCfg -Change @('/setacvalueindex', $GUID_MINE, $SUB_PROCESSOR, $s, '5') | Out-Null }
+                if ($cur.DC -gt 5) { Invoke-PowerCfg -Change @('/setdcvalueindex', $GUID_MINE, $SUB_PROCESSOR, $s, '5') | Out-Null }
+            } catch { $script:Log.Add('(최소 프로세서 상태 낮추기는 건너뜀)') }
+        }
+        Invoke-PowerCfg -Change @('/setactive', $GUID_MINE) | Out-Null
+    } catch {
+        if (-not $DryRun) {
+            if (-not $existed) {
+                # 새로 만든 계획인데 적용을 끝내지 못했으면, 쓰지 않는 계획과 기억이 남지 않게 지운다
+                try {
+                    if ((Get-ActiveSchemeGuid) -ne $GUID_MINE -and (Test-Scheme $GUID_MINE)) {
+                        Invoke-PowerCfg -Change @('-delete', $GUID_MINE) | Out-Null
+                        Clear-PreviousScheme
+                    }
+                } catch { }
+            } elseif ($before -and $before.IsMine -and $before.Boost -ge 0 -and $before.MaxState -ge 0) {
+                # 쓰던 우리 계획을 바꾸다 실패했으면, 저장된 값과 실제 동작이 어긋나지 않게 처음 값으로 되돌려 놓는다
+                try {
+                    [void](Set-PlanValue $S_MAXFREQ $before.MaxFreq)
+                    [void](Set-PlanValue $S_MAXSTATE $before.MaxState)
+                    [void](Set-PlanValue $S_BOOST $before.Boost)
+                    foreach ($s in $S_MAXFREQ_MORE) { [void](Set-PlanValue $s $before.MaxFreq) }
+                    foreach ($s in $S_MAXSTATE_MORE) { [void](Set-PlanValue $s $before.MaxState) }
+                    Invoke-PowerCfg -Change @('/setactive', $GUID_MINE) | Out-Null
+                } catch { }
             }
         }
+        throw
     }
-    Invoke-PowerCfg -Change @('/setactive', $GUID_MINE) | Out-Null
     if (-not $DryRun) {
         $st = Get-CurrentState
-        if (-not $st.IsMine -or $st.Boost -ne $p.Boost -or $st.MaxState -ne $p.MaxState -or $st.MaxFreq -ne $p.MaxFreq) {
-            throw ("적용 후 다시 읽어 보니 값이 달라요 (부스트 {0}, 최대 {1}%, 주파수 {2})" -f $st.Boost, $st.MaxState, $st.MaxFreq)
+        if (-not $st.IsMine -or $st.Boost -ne $m.Boost -or $st.MaxState -ne $m.MaxState -or $st.MaxFreq -ne $m.MaxFreq) {
+            throw ('적용 후 다시 읽어 보니 값이 달라요 (부스트 {0}, 최대 {1}%, 주파수 {2})' -f $st.Boost, $st.MaxState, $st.MaxFreq)
         }
     }
 }
@@ -202,23 +357,25 @@ function Set-Profile($p) {
 # 되돌리면 $true, 이 프로그램이 만든 전원 계획이 없으면 $false
 function Restore-Default {
     $script:Log.Clear()
+    $script:RestoreSwitched = $false   # 쓰던 계획으로 바꿔 줬는지(이미 다른 계획을 쓰고 있었으면 $false)
     $schemes = Get-SchemeList
-    if (-not ($schemes | Where-Object { $_.Guid -eq $GUID_MINE })) { return $false }
+    if (-not ($schemes | Where-Object { $_.Guid -eq $GUID_MINE })) {
+        if (-not $DryRun) { Clear-PreviousScheme }   # 계획 없이 기억만 남아 있으면 치운다
+        return $false
+    }
     # 이 프로그램 계획을 쓰는 중일 때만 다른 계획으로 바꾼다(사용자가 이미 다른 계획으로 바꿨으면 그대로 둔다)
     if ((Get-ActiveSchemeGuid) -eq $GUID_MINE) {
-        $prev = $null
-        if (Test-Path $StateFile) {
-            $raw = Get-Content -Path $StateFile -Raw
-            if ($raw) { $prev = $raw.Trim().ToLower() }
-        }
+        $prev = Get-PreviousScheme
         if (-not $prev -or $prev -eq $GUID_MINE -or -not ($schemes | Where-Object { $_.Guid -eq $prev })) {
             $prev = if ($schemes | Where-Object { $_.Guid -eq $GUID_BALANCED }) { $GUID_BALANCED }
                     else { ($schemes | Where-Object { $_.Guid -ne $GUID_MINE } | Select-Object -First 1).Guid }
         }
+        if (-not $prev) { throw '돌아갈 다른 전원 계획이 없어요. 제어판의 전원 옵션에서 기본 계획을 먼저 복원해 주세요.' }
         Invoke-PowerCfg -Change @('/setactive', $prev) | Out-Null
+        $script:RestoreSwitched = $true
     }
     Invoke-PowerCfg -Change @('-delete', $GUID_MINE) | Out-Null
-    if (-not $DryRun -and (Test-Path $StateFile)) { Remove-Item -Path $StateFile -Force }
+    if (-not $DryRun) { Clear-PreviousScheme }
     return $true
 }
 
@@ -262,7 +419,7 @@ $LiveReader = {
 }
 
 function Start-LiveReader {
-    $script:Live = [hashtable]::Synchronized(@{ Stop = $false; MHz = $null; Util = $null; Disks = $null; Zones = $null })
+    $script:Live = [hashtable]::Synchronized(@{ Stop = $false; Seq = 0; MHz = $null; Util = $null; Disks = $null; Zones = $null })
     # 읽기 함수(Read-LiveValues)를 백그라운드 쪽에 함수로 등록해 두고 부른다
     $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
     $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry('Read-LiveValues', $LiveReader.ToString())))
@@ -278,6 +435,7 @@ function Start-LiveReader {
             $Live.MHz = $v.MHz; $Live.Util = $v.Util
             if ($null -ne $v.Disks) { $Live.Disks = $v.Disks; $Live.Zones = $v.Zones }
             $n++
+            $Live.Seq = $n   # 새로 읽을 때마다 번호가 하나씩 올라간다
             for ($i = 0; $i -lt 20 -and -not $Live.Stop; $i++) { Start-Sleep -Milliseconds 100 }
         }
     })
@@ -306,11 +464,15 @@ W(와트) 제한은 윈도우가 아니라 바이오스에서 걸어야 확실�
 1) 이 프로그램의 '바이오스로 재부팅'을 누르거나, 켤 때 Del 키를 연타합니다.
 2) 오른쪽 화살표로 Advanced 탭으로 갑니다.
 3) Ctrl + F1 을 누르면 숨은 메뉴가 나옵니다.
-4) AMD CBS → CPU Common Options → Core Performance Boost → Disabled
-   (부스트를 끕니다. 이 프로그램의 '추천'과 같은 효과라 둘 중 하나만 해도 됩니다.)
-5) AMD CBS → SMU Common Options → System Configuration → 35W
+4) AMD CBS → SMU Common Options → System Configuration → 35W
    (35W는 이 CPU들의 AMD 사양 최저값입니다.)
-6) F10(Save & Exit)으로 저장하고 재부팅합니다.
+5) F10(Save & Exit)으로 저장하고 재부팅합니다.
+
+[선택] 부스트를 바이오스에서 끄기
+   AMD CBS → CPU Common Options → Core Performance Boost → Disabled
+   - 이 프로그램의 '부스트 끄기 (99%)'와 같은 효과라서, 그 버튼을 쓴다면 하지 않아도 됩니다.
+   - 이 항목을 끄면 부스트가 아예 꺼집니다. 이 프로그램에서 기본 클럭보다 높은
+     '최대 클럭 제한'(게임 값 등)을 쓰려면 끄지 마세요.
 
 [주의]
 - 위 항목 말고 다른 메뉴는 건드리지 마세요. 잘못 바꾸면 부팅이 안 될 수 있습니다.
@@ -325,12 +487,15 @@ $Checklist = @'
 F1은 상판이 막힌 구조라 상판 쪽(SSD)이 특히 뜨거워지기 쉽습니다.
 
 [소프트웨어로 할 수 있는 것 - 이 프로그램]
-- '추천' 버튼: 부스트 끔 + 최대 99%. 쉬는 중 전력과 온도가 크게 줄어듭니다.
-- 바이오스에서 35W 전력 제한을 같이 하면 효과가 가장 큽니다.
-  ('바이오스 설정 방법 보기' 참고)
+- '부스트 끄기 (99%)': 가장 간단합니다. 쉬는 중 전력과 온도가 크게 줄어듭니다.
+- '최대 클럭 제한': 성능을 덜 잃으면서 온도를 낮추고 싶을 때 씁니다.
+  값을 낮출수록 시원하고, 높일수록 빠릅니다.
+- 여러 코어를 오래 쓰는 작업(게임·인코딩)의 온도는 클럭보다 전력(W)의 영향을 더 받습니다.
+  이럴 때는 바이오스에서 35W 전력 제한을 같이 하면 효과가 가장 큽니다.
+  ('바이오스 설정 방법' 참고)
 
 [하드웨어로 할 수 있는 것]
-- 상단에 팬을 다는 교체 케이스나 써멀 교체로 온도를 더 낮출 수 있습니다.
+- 상단에 팬을 다는 교체 케이스나 서멀구리스를 다시 바르는 것으로 온도를 더 낮출 수 있습니다.
 - 바닥 흡기구가 막히지 않게 받침을 대고, 위쪽에 바람이 잘 통하게 두세요.
 - 동봉된 정품 어댑터를 쓰세요.
 
@@ -370,13 +535,13 @@ function New-Label([string]$text, [int]$x, [int]$y, [int]$w, [int]$h, $font = $n
     return $l
 }
 
-function New-Button([string]$text, [int]$x, [int]$y, [int]$w, [int]$h) {
+function New-Button([string]$text, [int]$x, [int]$y, [int]$w, [int]$h, $font = $null) {
     $b = New-Object System.Windows.Forms.Button
     $b.Text = $text
     $b.UseMnemonic = $false
     $b.Location = New-Object System.Drawing.Point($x, $y)
     $b.Size = New-Object System.Drawing.Size($w, $h)
-    $b.Font = $script:fN
+    $b.Font = $(if ($font) { $font } else { $script:fN })
     return $b
 }
 
@@ -385,44 +550,155 @@ function Set-Status([string]$text, $color = $null) {
     $script:lblStatus.ForeColor = $(if ($color) { $color } else { [System.Drawing.SystemColors]::ControlText })
 }
 
-function Update-StateUI {
+# 적용 중인 버튼은 초록 바탕에 ● 표시
+function Set-ButtonOn($b, [bool]$on, [string]$text) {
+    $b.Text = $(if ($on) { '● ' + $text } else { $text })
+    if ($on) { $b.UseVisualStyleBackColor = $false; $b.BackColor = $script:cOn }
+    else { $b.BackColor = [System.Drawing.SystemColors]::Control; $b.UseVisualStyleBackColor = $true }
+}
+
+# 숫자 칸의 글자를 MHz 값으로 바꾼다. 숫자가 아니거나 범위 밖이면 $null (고쳐 쓰지 않는다)
+function ConvertTo-ClockValue([string]$text) {
+    $clean = ("$text" -replace '[,\s]', '')
+    if ($clean -notmatch '^[0-9]{1,6}$') { return $null }   # 0-9 만 받는다(전각 숫자 등은 숫자로 바꾸지 못하므로)
+    $n = [int]$clean
+    if ($n -lt $script:Cpu.Min -or $n -gt $script:Cpu.Max) { return $null }
+    return $n
+}
+
+# 슬라이더와 숫자 칸을 같은 값으로 맞춘다(범위를 벗어나면 가장 가까운 값으로)
+function Set-ClockControls([int]$mhz) {
+    $v = [math]::Max([int]$script:Cpu.Min, [math]::Min([int]$script:Cpu.Max, $mhz))
+    $script:Syncing = $true
+    try {
+        $script:txtClock.Text = "$v"
+        $t = [int][math]::Round($v / 100.0)
+        $script:tbClock.Value = [math]::Max($script:tbClock.Minimum, [math]::Min($script:tbClock.Maximum, $t))
+    } finally { $script:Syncing = $false }
+    Update-ApplyButton
+}
+
+# '적용' 버튼의 초록 표시: 숫자 칸의 값이 지금 적용된 직접 값과 같을 때만 켠다
+function Update-ApplyButton {
+    $n = ConvertTo-ClockValue $script:txtClock.Text
+    Set-ButtonOn $script:btnApply ($script:AppliedCustom -gt 0 -and $null -ne $n -and $n -eq $script:AppliedCustom) '적용'
+}
+
+# 속도 막대: 0 ~ 눈금 끝까지가 CPU 클럭. 파란 부분이 지금 실제 클럭, 빗금 부분이 제한으로 막힌 구간.
+function Write-SpeedBar($g, [int]$w, [int]$h) {
+    $max = [double]$script:ScaleMax
+    if ($max -le 0) { return }
+    $barH = 16
+    $bw = $w - 1
+    $g.FillRectangle($script:brTrack, 0, 0, $bw, $barH)
+    $lim = [double]$script:BarLimit
+    $lx = -1
+    if ($lim -gt 0 -and $lim -lt $max) {
+        $lx = [int]($lim / $max * $bw)
+        $g.FillRectangle($script:brLocked, $lx, 0, $bw - $lx, $barH)
+    }
+    $mhz = [double]$script:BarActual
+    if ($mhz -gt 0) {
+        $fw = [int]([math]::Min(1.0, $mhz / $max) * $bw)
+        if ($fw -gt 0) { $g.FillRectangle($script:brFill, 0, 0, $fw, $barH) }
+    }
+    $g.DrawRectangle($script:penBorder, 0, 0, $bw, $barH)
+    if ($lx -ge 0) {
+        $g.DrawLine($script:penLimit, $lx, 0, $lx, $barH)
+        $txt = '제한 {0:0.0#}GHz' -f ($lim / 1000)
+        $sz = $g.MeasureString($txt, $script:fT)
+        $tx = if (($bw - $lx) -gt ($sz.Width + 8)) { $lx + 4 } else { $lx - $sz.Width - 4 }
+        $g.DrawString($txt, $script:fT, $script:brLimitText, [single]$tx, [single]1)
+    }
+    # 눈금: 1GHz마다
+    for ($t = 0; $t -le $max; $t += 1000) {
+        $x = [int]($t / $max * $bw)
+        $g.DrawLine($script:penBorder, $x, $barH, $x, $barH + 3)
+        $lab = if ($t -eq 0) { '0' } elseif (($t + 1000) -gt $max) { '{0}GHz' -f [int]($t / 1000) } else { '{0}' -f [int]($t / 1000) }
+        $sz = $g.MeasureString($lab, $script:fT)
+        $px = [math]::Max(0, [math]::Min($bw - $sz.Width, $x - $sz.Width / 2))
+        $g.DrawString($lab, $script:fT, $script:brTick, [single]$px, [single]($barH + 3))
+    }
+}
+
+function Update-StateUI([bool]$SyncControls = $false) {
+    $script:LastStateTick = [Environment]::TickCount
     try {
         $st = Get-CurrentState
-        $script:lblPlan.Text = "전원 계획: $($st.Name)"
-        $freqTxt = if ($st.MaxFreq -gt 0) { "$($st.MaxFreq) MHz" } else { '제한 없음' }
+        $mode = Get-StateMode $st
+        $freqTxt = if ($st.MaxFreq -gt 0) { '{0:N0}MHz' -f $st.MaxFreq } else { '제한 없음' }
         $boostTxt = if ($BoostNames.ContainsKey($st.Boost)) { $BoostNames[$st.Boost] } else { '알 수 없음' }
         $stateTxt = if ($st.MaxState -ge 0) { "$($st.MaxState)%" } else { '알 수 없음' }
-        $detail = "부스트 $boostTxt · 최대 $stateTxt · 주파수 $freqTxt"
-        $match = Find-ProfileMatch $st
-        if ($match) {
-            $script:lblMode.Text = "적용 중: $($match.Title)`r`n$detail"
-            $script:lblMode.ForeColor = [System.Drawing.Color]::FromArgb(0, 120, 60)
-        } elseif ($st.IsMine) {
-            $script:lblMode.Text = "적용 중: 이 프로그램 전원 계획(값을 직접 바꾼 상태)`r`n$detail"
-            $script:lblMode.ForeColor = [System.Drawing.SystemColors]::ControlText
-        } else {
-            $script:lblMode.Text = "적용 중: 이 프로그램 설정 아님(윈도우 설정 그대로)`r`n$detail"
-            $script:lblMode.ForeColor = [System.Drawing.SystemColors]::ControlText
+        $planName = if ($st.IsMine) { $AppName } else { $st.Name }   # 우리 계획 이름은 직접 쓴다(다른 언어 윈도우에서 깨져 읽힐 수 있어서)
+        $script:lblDetail.Text = "전원 계획: $planName  ·  부스트 $boostTxt  ·  최대 $stateTxt  ·  주파수 $freqTxt"
+        switch ($mode.Kind) {
+            'boostoff' {
+                $script:lblMode.Text = if ($script:Cpu.Base -gt 0) { '● 적용 중: 부스트 끄기 (99%) → 기본 클럭 약 {0:0.0}GHz까지' -f ($script:Cpu.Base / 1000) }
+                                       else { '● 적용 중: 부스트 끄기 (99%)' }
+                $script:lblMode.ForeColor = $script:cGreen
+            }
+            'clock' {
+                $script:lblMode.Text = ('● 적용 중: 최대 클럭 {0:N0}MHz 제한' -f $mode.MaxFreq)
+                $script:lblMode.ForeColor = $script:cGreen
+            }
+            'custom' {
+                $script:lblMode.Text = '적용 중: 이 프로그램 전원 계획 (값을 직접 바꾼 상태)'
+                $script:lblMode.ForeColor = [System.Drawing.SystemColors]::ControlText
+            }
+            default {
+                $script:lblMode.Text = '적용 안 함 · 윈도우 설정 그대로'
+                $script:lblMode.ForeColor = [System.Drawing.SystemColors]::ControlText
+            }
         }
-        foreach ($k in $script:Buttons.Keys) {
-            $b = $script:Buttons[$k]
-            $isOn = ($match -and $match.Key -eq $k)
-            $b.Text = $(if ($isOn) { '● ' + $b.Tag.Title } else { $b.Tag.Title })
-            if ($isOn) { $b.UseVisualStyleBackColor = $false; $b.BackColor = [System.Drawing.Color]::FromArgb(205, 240, 212) }
-            else { $b.BackColor = [System.Drawing.SystemColors]::Control; $b.UseVisualStyleBackColor = $true }
+        $newLimit = Get-LimitMHz $st
+        $watch = ($mode.Kind -eq 'boostoff' -or $mode.Kind -eq 'clock')
+        if ($newLimit -ne $script:BarLimit -or $watch -ne $script:WatchLimit) { $script:OverCount = 0 }   # 설정이 바뀌면 다시 센다
+        $script:BarLimit = $newLimit
+        $script:WatchLimit = $watch
+        # 제한이 눈금 끝이거나 그보다 높으면 빨간 선이 보이게 눈금을 늘린다(제한이 낮아지면 다시 줄어든다)
+        $need = if ($newLimit -ge $script:ScaleBase) { [int]([math]::Floor($newLimit / 500.0) * 500 + 500) } else { $script:ScaleBase }
+        $script:ScaleMax = [int][math]::Max($need, $script:ScaleLive)
+        Set-ButtonOn $script:btnBoostOff ($mode.Kind -eq 'boostoff') ([string]$script:btnBoostOff.Tag)
+        $onChip = $false
+        foreach ($b in $script:ChipButtons) {
+            $isOn = ($mode.Kind -eq 'clock' -and $mode.MaxFreq -eq [int]$b.Tag.MHz)
+            if ($isOn) { $onChip = $true }
+            Set-ButtonOn $b $isOn ([string]$b.Tag.Title)
         }
+        $script:AppliedCustom = if ($mode.Kind -eq 'clock' -and -not $onChip) { [int]$mode.MaxFreq } else { 0 }
+        if ($SyncControls -and $mode.Kind -eq 'clock') { Set-ClockControls $mode.MaxFreq } else { Update-ApplyButton }
     } catch {
         $script:lblMode.Text = "상태를 읽지 못했어요: $($_.Exception.Message)"
+        $script:lblMode.ForeColor = [System.Drawing.Color]::Red
     }
+    $script:bar.Invalidate()
 }
 
 # 백그라운드가 읽어 둔 값을 화면에 옮긴다(1초마다, 금방 끝남)
 function Update-Live {
     $L = $script:Live
     if (-not $L) { return }
-    if ($null -eq $L.MHz) { $script:lblClock.Text = '실제 CPU 클럭: 읽는 중…' }
-    elseif ($L.MHz -le 0) { $script:lblClock.Text = '실제 CPU 클럭: 읽을 수 없음' }
-    else { $script:lblClock.Text = ('실제 CPU 클럭: {0:N0} MHz   (사용률 {1}%)' -f $L.MHz, $L.Util) }
+    if ($null -eq $L.MHz) { $script:lblClock.Text = '실제 CPU 클럭: 읽는 중…'; $script:BarActual = 0 }
+    elseif ($L.MHz -le 0) { $script:lblClock.Text = '실제 CPU 클럭: 읽을 수 없음'; $script:BarActual = 0 }
+    else {
+        $script:lblClock.Text = ('실제 CPU 클럭: {0:N0} MHz   (사용률 {1}%)' -f $L.MHz, $L.Util)
+        $script:BarActual = [int]$L.MHz
+        # 눈금 끝보다 높게 나오면 눈금을 늘린다
+        if ($script:BarActual -gt $script:ScaleMax) {
+            $script:ScaleLive = [int]([math]::Ceiling($script:BarActual / 500.0) * 500)
+            $script:ScaleMax = $script:ScaleLive
+        }
+        # 제한을 걸었는데 실제 클럭이 계속 그보다 높으면(새로 읽은 값 4번 연속) 이 PC에서는 제한이 듣지 않는 것
+        $seq = $L.Seq
+        if ($null -ne $seq -and $seq -ne $script:LastSeq) {
+            $script:LastSeq = $seq
+            $lim = $script:BarLimit
+            if ($script:WatchLimit -and $lim -gt 0 -and $L.MHz -gt ($lim * 1.04 + 50)) { $script:OverCount++ } else { $script:OverCount = 0 }
+        }
+    }
+    $overLimit = ($script:OverCount -ge 4)
+    $script:lblClock.ForeColor = $(if ($overLimit) { [System.Drawing.Color]::DarkOrange } else { [System.Drawing.SystemColors]::ControlText })
+    $script:bar.Invalidate()
 
     $d = $L.Disks
     if ($null -eq $d) { $script:lblSsd.Text = 'SSD 온도: 읽는 중…' }
@@ -435,8 +711,11 @@ function Update-Live {
             $k = "$($x.No)|$($x.Name)"
             if (-not $script:DiskMax.ContainsKey($k) -or $x.Temp -gt $script:DiskMax[$k]) { $script:DiskMax[$k] = $x.Temp }
         }
-        $parts = @($d) | ForEach-Object { '디스크{0} {1}℃ (최고 {2}℃)' -f $_.No, $_.Temp, $script:DiskMax["$($_.No)|$($_.Name)"] }
-        $txt = 'SSD 온도: ' + ($parts -join '  /  ')
+        # 디스크가 셋 이상이면 한 줄에 들어가게 짧게 쓴다
+        $many = (@($d).Count -ge 3)
+        $fmt = if ($many) { '디스크{0} {1}℃(최고 {2})' } else { '디스크{0} {1}℃ (최고 {2}℃)' }
+        $parts = @($d) | ForEach-Object { $fmt -f $_.No, $_.Temp, $script:DiskMax["$($_.No)|$($_.Name)"] }
+        $txt = 'SSD 온도: ' + ($parts -join $(if ($many) { ' / ' } else { '  /  ' }))
         if (@($d).Count -eq 1) { $txt += '   · 60℃ 주의 · 70℃ 높음' }
         $script:lblSsd.Text = $txt
         $names = (@($d) | ForEach-Object { '디스크{0}: {1}' -f $_.No, $_.Name }) -join "`r`n"
@@ -445,23 +724,35 @@ function Update-Live {
         $script:lblSsd.ForeColor = $(if ($max -ge 70) { [System.Drawing.Color]::Red } elseif ($max -ge 60) { [System.Drawing.Color]::DarkOrange } else { [System.Drawing.SystemColors]::ControlText })
     }
 
-    $z = $L.Zones
-    if ($null -eq $z) { $script:lblZone.Text = '' }
-    elseif (@($z).Count -gt 0) { $script:lblZone.Text = '메인보드 온도(ACPI, 참고용): ' + ((@($z) | ForEach-Object { "$_℃" }) -join ' / ') }
-    else { $script:lblZone.Text = 'CPU 온도: 윈도우로는 읽을 수 없어요 - 정확한 값은 HWiNFO로 확인' }
+    if ($overLimit) {
+        $script:lblZone.Text = '실제 클럭이 제한보다 계속 높아요. 이 PC에서는 이 방법이 듣지 않는 것 같아요. 다른 방법을 써 보세요.'
+        $script:lblZone.ForeColor = [System.Drawing.Color]::DarkOrange
+    } else {
+        $script:lblZone.ForeColor = $script:cGray
+        $z = $L.Zones
+        if ($null -eq $z) { $script:lblZone.Text = '' }
+        elseif (@($z).Count -gt 0) { $script:lblZone.Text = '메인보드 온도(ACPI, 참고용): ' + ((@($z) | ForEach-Object { "$_℃" }) -join ' / ') }
+        else { $script:lblZone.Text = 'CPU 온도는 윈도우로는 읽을 수 없어요. 정확한 값은 HWiNFO 같은 프로그램으로 확인하세요.' }
+    }
 }
 
-function Invoke-ProfileClick([string]$key) {
+# $action: 모드 객체(Set-Mode에 넘길 것) 또는 문자열 'restore'
+function Invoke-ModeClick($action) {
     $script:form.UseWaitCursor = $true
     try {
-        if ($key -eq 'restore') {
+        if ($action -is [string] -and $action -eq 'restore') {
             $ok = Restore-Default
             if (-not $ok) { Set-Status '이 프로그램으로 바꾼 설정이 없어서 되돌릴 게 없어요.' }
-            else { Set-Status '원래 전원 계획으로 되돌리고, 이 프로그램이 만든 전원 계획을 지웠어요.' ([System.Drawing.Color]::FromArgb(0, 90, 160)) }
+            elseif ($script:RestoreSwitched) { Set-Status '원래 전원 계획으로 되돌리고, 이 프로그램이 만든 전원 계획을 지웠어요.' $script:cBlue }
+            else { Set-Status '이 프로그램이 만든 전원 계획을 지웠어요. 지금 쓰는 전원 계획은 그대로예요.' $script:cBlue }
         } else {
-            $p = $script:Profiles[$key]
-            Set-Profile $p
-            Set-Status ("적용했어요: {0}. 실제 클럭은 몇 초 안에 바뀝니다." -f $p.Title) ([System.Drawing.Color]::FromArgb(0, 120, 60))
+            Set-Mode $action
+            $msg = '적용했어요: {0}. 실제 클럭은 몇 초 안에 바뀝니다.'
+            # 기본 클럭보다 낮은 제한은 CPU에 따라 정한 값보다 더 낮게 잡힌다(실제 측정으로 확인)
+            if ($action.Kind -eq 'clock' -and $script:Cpu.Base -gt 0 -and $action.MaxFreq -lt $script:Cpu.Base) {
+                $msg = '적용했어요: {0}. 기본 클럭보다 낮게 정하면 실제 클럭은 더 낮게 나올 수 있어요.'
+            }
+            Set-Status ($msg -f $action.Title) $script:cGreen
         }
         if ($DryRun -and $script:Log.Count -gt 0) {
             [void][System.Windows.Forms.MessageBox]::Show(("[시험 모드] 실제로는 바꾸지 않았어요. 실행할 명령:`n`n" + ($script:Log -join "`n")), $AppName)
@@ -471,189 +762,402 @@ function Invoke-ProfileClick([string]$key) {
     } finally {
         $script:form.UseWaitCursor = $false
     }
-    Update-StateUI
+    Update-StateUI $true
+}
+
+# 숫자 칸에 적힌 값으로 적용한다. 쓸 수 없는 값이면 고쳐 쓰지 않고 안내만 한다.
+function Invoke-CustomApply {
+    $n = ConvertTo-ClockValue $script:txtClock.Text
+    if ($null -eq $n) {
+        Set-Status ('적용하지 않았어요. {0}~{1} 사이의 MHz 숫자로 적어 주세요. (예: 4.5GHz → 4500)' -f $script:Cpu.Min, $script:Cpu.Max) ([System.Drawing.Color]::Red)
+        try { [void]$script:txtClock.Focus(); $script:txtClock.SelectAll() } catch { }
+        return
+    }
+    try { $m = New-ClockMode $n }
+    catch { Set-Status ('실패: ' + $_.Exception.Message) ([System.Drawing.Color]::Red); return }
+    Invoke-ModeClick $m
 }
 
 function New-DesktopShortcut {
-    $desk = [Environment]::GetFolderPath('Desktop')
+    # 관리자 권한으로 다시 띄운 창에서는 '처음 실행한 사용자'의 바탕화면을 쓴다
+    $desk = ''
+    if ($UserDesktop -and (Test-Path -LiteralPath $UserDesktop -PathType Container)) { $desk = $UserDesktop }
+    if (-not $desk) { $desk = [Environment]::GetFolderPath('Desktop') }
     $ws = New-Object -ComObject WScript.Shell
     $lnk = $ws.CreateShortcut((Join-Path $desk "$AppName.lnk"))
-    $lnk.TargetPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $lnk.TargetPath = $PsExe
     $lnk.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptPath`""
     $lnk.WorkingDirectory = $AppDir
     $lnk.WindowStyle = 7
-    $icon = Join-Path $env:SystemRoot 'System32\powercpl.dll'
-    if (Test-Path $icon) { $lnk.IconLocation = "$icon,0" }
+    $icon = Join-Path $SysDir 'powercpl.dll'
+    if (Test-Path -LiteralPath $icon) { $lnk.IconLocation = "$icon,0" }
     $lnk.Description = 'Firebat F1 발열 관리'
     $lnk.Save()
     [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($ws)
 }
 
+function Save-WindowImage([string]$path) {
+    $f = $script:form
+    $f.Refresh()
+    $bmp = New-Object System.Drawing.Bitmap($f.Width, $f.Height)
+    $f.DrawToBitmap($bmp, (New-Object System.Drawing.Rectangle(0, 0, $f.Width, $f.Height)))
+    $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+    $bmp.Dispose()
+}
+
 function Show-MainWindow {
     Add-Type -AssemblyName System.Windows.Forms, System.Drawing
     [System.Windows.Forms.Application]::EnableVisualStyles()
+    # 예상하지 못한 오류가 나도 영어 오류 창을 띄우지 않고 아래 상태 줄에 알린다
+    if (-not $script:ErrorHookAdded) {
+        try {
+            [System.Windows.Forms.Application]::add_ThreadException({
+                try { Set-Status ('문제가 생겼어요: ' + $_.Exception.Message) ([System.Drawing.Color]::Red) } catch { }
+            })
+            $script:ErrorHookAdded = $true
+        } catch { }
+    }
     $script:fN = New-Object System.Drawing.Font('Malgun Gothic', 10)
     $script:fB = New-Object System.Drawing.Font('Malgun Gothic', 10, [System.Drawing.FontStyle]::Bold)
     $script:fH = New-Object System.Drawing.Font('Malgun Gothic', 16, [System.Drawing.FontStyle]::Bold)
     $script:fS = New-Object System.Drawing.Font('Malgun Gothic', 9)
+    $script:fT = New-Object System.Drawing.Font('Malgun Gothic', 7.5)
+    $script:cGreen = [System.Drawing.Color]::FromArgb(0, 120, 60)
+    $script:cBlue = [System.Drawing.Color]::FromArgb(0, 90, 160)
+    $script:cGray = [System.Drawing.Color]::FromArgb(110, 110, 110)
+    $script:cOn = [System.Drawing.Color]::FromArgb(205, 240, 212)
+    $cBack = [System.Drawing.Color]::FromArgb(250, 250, 250)
+    $script:brTrack = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(232, 234, 237))
+    $script:brFill = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(66, 133, 244))
+    $script:brLocked = New-Object System.Drawing.Drawing2D.HatchBrush([System.Drawing.Drawing2D.HatchStyle]::BackwardDiagonal, [System.Drawing.Color]::FromArgb(170, 170, 170), [System.Drawing.Color]::FromArgb(214, 214, 214))
+    $script:brTick = New-Object System.Drawing.SolidBrush($script:cGray)
+    $script:brLimitText = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(150, 30, 30))
+    $script:penBorder = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(160, 160, 160))
+    $script:penLimit = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(200, 40, 40), 2)
+    $script:Syncing = $false
+    $script:BarActual = 0
+    $script:BarLimit = 0
+    $script:WatchLimit = $false
+    $script:OverCount = 0
+    $script:LastSeq = -1
+    $script:AppliedCustom = 0
+    $script:LastStateTick = 0
+    $script:DiskMax = @{}
+    $cpu = $script:Cpu
+    # 막대의 눈금 끝(MHz): 처음 값(ScaleBase), 실제 클럭이 넘어서 늘어난 값(ScaleLive), 지금 쓰는 값(ScaleMax)
+    $script:ScaleBase = if ($cpu.Boost -gt 0) { [int]([math]::Ceiling($cpu.Boost / 500.0) * 500) }
+                        else { [int]([math]::Max(4000, [math]::Ceiling($cpu.Base * 1.35 / 500.0) * 500)) }
+    $script:ScaleLive = $script:ScaleBase
+    $script:ScaleMax = $script:ScaleBase
 
     $form = New-Object System.Windows.Forms.Form
     $script:form = $form
     $form.Text = "$AppName $AppVersion" + $(if ($DryRun) { '  [시험 모드 - 실제로 바꾸지 않음]' } else { '' })
-    $form.ClientSize = New-Object System.Drawing.Size(640, 776)
+    $form.ClientSize = New-Object System.Drawing.Size(640, 610)
     $form.FormBorderStyle = 'FixedSingle'
     $form.MaximizeBox = $false
     $form.StartPosition = 'CenterScreen'
-    $form.BackColor = [System.Drawing.Color]::FromArgb(250, 250, 250)
+    $form.BackColor = $cBack
 
-    $form.Controls.Add((New-Label '미니PC 발열 관리' 12 10 616 34 $script:fH))
-    $cpu = $script:Cpu
+    # ----- 머리말 -----
+    $form.Controls.Add((New-Label $AppName 12 8 616 32 $script:fH))
     $cpuTxt = "감지된 CPU: $($cpu.Label)"
     if ($cpu.Boost -gt 0) { $cpuTxt += ('   ·   기본 {0:0.0}GHz / 부스트 {1:0.0}GHz' -f ($cpu.Base / 1000), ($cpu.Boost / 1000)) }
-    $form.Controls.Add((New-Label $cpuTxt 14 48 616 22 $script:fB))
+    $lc = New-Label $cpuTxt 14 42 614 22 $script:fB
+    $lc.AutoEllipsis = $true
+    $form.Controls.Add($lc)
     if ($cpu.Model -eq 'other') {
-        $w = New-Label "Firebat F1(7640HS·H255)용으로 만든 프로그램이에요.`r`n이 CPU에서도 윈도우 전원 설정은 바뀌지만 값은 확인하지 않았어요." 14 72 616 36 $script:fS
+        $w = New-Label 'Firebat F1(7640HS·H255)용이에요. 이 CPU에서도 동작하지만 값은 확인되지 않았어요.' 14 64 614 20 $script:fS
         $w.ForeColor = [System.Drawing.Color]::DarkOrange
     } else {
-        $w = New-Label '지원 모델이에요. 버튼을 누르면 바로 적용되고, 언제든 "원래대로"로 되돌릴 수 있어요.' 14 72 616 36 $script:fS
-        $w.ForeColor = [System.Drawing.Color]::FromArgb(0, 120, 60)
+        $w = New-Label "지원 모델이에요. 누르면 바로 적용되고, 언제든 '원래대로'로 되돌릴 수 있어요." 14 64 614 20 $script:fS
+        $w.ForeColor = $script:cGreen
     }
     $form.Controls.Add($w)
 
-    # 지금 상태
+    # ----- 지금 상태 -----
     $gb = New-Object System.Windows.Forms.GroupBox
     $gb.Text = '지금 상태'; $gb.Font = $script:fB
-    $gb.Location = New-Object System.Drawing.Point(10, 110); $gb.Size = New-Object System.Drawing.Size(620, 172)
-    $script:lblPlan = New-Label '' 12 24 596 22
-    $script:lblMode = New-Label '' 12 48 596 44
-    $script:lblClock = New-Label '실제 CPU 클럭: 읽는 중…' 12 94 596 22
-    $script:lblSsd = New-Label 'SSD 온도: 읽는 중…' 12 118 596 22
-    $script:lblZone = New-Label '' 12 142 596 22
+    $gb.Location = New-Object System.Drawing.Point(10, 88); $gb.Size = New-Object System.Drawing.Size(620, 164)
+    $script:lblMode = New-Label '' 12 22 596 22 $script:fB
+    $script:lblMode.AutoEllipsis = $true
+    $script:lblDetail = New-Label '' 12 44 596 18 $script:fS
+    $script:lblDetail.ForeColor = $script:cGray
+    $script:lblDetail.AutoEllipsis = $true
+    $script:bar = New-Object System.Windows.Forms.PictureBox
+    $script:bar.Location = New-Object System.Drawing.Point(12, 66)
+    $script:bar.Size = New-Object System.Drawing.Size(596, 34)
+    $script:bar.Add_Paint({ try { Write-SpeedBar $_.Graphics $this.Width $this.Height } catch { } })
+    $script:lblClock = New-Label '실제 CPU 클럭: 읽는 중…' 12 102 596 20
+    $script:lblSsd = New-Label 'SSD 온도: 읽는 중…' 12 122 596 20
+    $script:lblSsd.AutoEllipsis = $true
+    $script:lblZone = New-Label '' 12 142 596 18 $script:fS
+    $script:lblZone.ForeColor = $script:cGray
+    $script:lblZone.AutoEllipsis = $true
     $script:tip = New-Object System.Windows.Forms.ToolTip
-    $script:DiskMax = @{}
-    $gb.Controls.AddRange(@($script:lblPlan, $script:lblMode, $script:lblClock, $script:lblSsd, $script:lblZone))
+    $script:tip.SetToolTip($script:bar, '파란 부분: 지금 실제 클럭 / 빗금 부분: 제한으로 막힌 구간')
+    $gb.Controls.AddRange(@($script:lblMode, $script:lblDetail, $script:bar, $script:lblClock, $script:lblSsd, $script:lblZone))
     $form.Controls.Add($gb)
 
-    # 원클릭 설정
+    # ----- CPU 최대 속도 정하기 -----
     $gp = New-Object System.Windows.Forms.GroupBox
-    $gp.Text = '원클릭 설정 (누르면 바로 적용)'; $gp.Font = $script:fB
-    $gp.Location = New-Object System.Drawing.Point(10, 290); $gp.Size = New-Object System.Drawing.Size(620, 282)
-    $rows = @()
-    foreach ($p in $script:Profiles.Values) { $rows += $p }
-    $rows += [pscustomobject]@{ Key = 'restore'; Title = '원래대로 되돌리기'
-        Desc = "이 프로그램이 만든 전원 계획을 지우고,`r`n쓰던 전원 계획(보통 '균형 조정')으로 돌아가요." }
-    $script:Buttons = [ordered]@{}
-    $y = 24
-    foreach ($r in $rows) {
-        $b = New-Button $r.Title 12 $y 190 54
-        $b.Font = $script:fB
-        $b.Tag = $r
-        $b.Add_Click({ Invoke-ProfileClick $this.Tag.Key })
-        if ($r.Key -ne 'restore') { $script:Buttons[$r.Key] = $b }
-        $d = New-Label $r.Desc 212 ($y + 4) 396 50
-        $gp.Controls.AddRange(@($b, $d))
-        $y += 62
-    }
-    $form.Controls.Add($gp)
+    $gp.Text = 'CPU 최대 속도 정하기 (누르면 바로 적용)'; $gp.Font = $script:fB
+    $gp.Location = New-Object System.Drawing.Point(10, 258); $gp.Size = New-Object System.Drawing.Size(620, 262)
 
-    # 바이오스
-    $gbi = New-Object System.Windows.Forms.GroupBox
-    $gbi.Text = '전력 제한(W)은 바이오스에서'; $gbi.Font = $script:fB
-    $gbi.Location = New-Object System.Drawing.Point(10, 580); $gbi.Size = New-Object System.Drawing.Size(620, 112)
-    $gbi.Controls.Add((New-Label "W(와트) 제한은 바이오스에서 걸어야 확실히 먹어요. 7640HS·H255 모두 35W를 권장해요.`r`nAMD 사양의 최저값이고, 한 번 해 두면 계속 유지돼요." 12 22 596 44))
-    $bg = New-Button '바이오스 설정 방법 보기' 12 70 220 32
-    $bg.Add_Click({ Show-TextWindow '바이오스 전력 제한 방법' $BiosGuide })
-    $br = New-Button '바이오스로 재부팅' 242 70 180 32
-    $br.Add_Click({
-        $ans = [System.Windows.Forms.MessageBox]::Show("지금 바로 재부팅해서 바이오스로 들어갑니다.`n저장 안 한 작업이 있으면 먼저 저장하세요.`n`n계속할까요?", $AppName, 'YesNo', 'Warning')
-        if ($ans -ne 'Yes') { return }
-        if ($DryRun) { [void][System.Windows.Forms.MessageBox]::Show('[시험 모드] shutdown /r /fw /t 0 을 실행할 차례예요.', $AppName); return }
-        $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-        try { & shutdown.exe /r /fw /t 0 2>&1 | Out-Null } finally { $ErrorActionPreference = $old }
-        if ($LASTEXITCODE -ne 0) {
-            [void][System.Windows.Forms.MessageBox]::Show('바이오스로 바로 재부팅하지 못했어요. 컴퓨터를 다시 켤 때 Del 키를 연타하세요.', $AppName)
+    # 방법 1: 부스트 끄기 (99%)
+    $script:btnBoostOff = New-Button '부스트 끄기 (99%)' 12 24 190 50 $script:fB
+    $script:btnBoostOff.Tag = '부스트 끄기 (99%)'
+    $script:btnBoostOff.Add_Click({ Invoke-ModeClick (New-BoostOffMode) })
+    $line1 = if ($cpu.Base -gt 0) { '부스트를 끄고 기본 클럭(약 {0:0.0}GHz)까지만 써요.' -f ($cpu.Base / 1000) }
+             else { '부스트를 끄고 기본 클럭까지만 써요.' }
+    $slowCpu = ($cpu.Model -eq 'other' -and $cpu.Base -gt 0 -and $cpu.Base -lt 2500)
+    $line2 = if ($slowCpu) { '이 CPU는 기본 클럭이 낮아서 많이 느려질 수 있어요.' } else { '가장 간단해요. 처음이면 이것부터.' }
+    $d1 = New-Label "$line1`r`n$line2" 212 26 396 46
+    if ($slowCpu) { $d1.ForeColor = [System.Drawing.Color]::DarkOrange }
+    $gp.Controls.AddRange(@($script:btnBoostOff, $d1))
+
+    foreach ($sy in @(79, 207)) {
+        $sep = New-Object System.Windows.Forms.Label
+        $sep.AutoSize = $false
+        $sep.BorderStyle = 'Fixed3D'
+        $sep.Location = New-Object System.Drawing.Point(12, $sy)
+        $sep.Size = New-Object System.Drawing.Size(596, 2)
+        $gp.Controls.Add($sep)
+    }
+
+    # 방법 2: 최대 클럭 제한
+    $t2 = New-Label '최대 클럭 제한' 12 84 112 22 $script:fB
+    $h2 = New-Label '클럭 상한만 낮춰요. 기본 클럭보다 높게 잡으면 부스트를 그만큼만 씁니다.' 126 86 482 18 $script:fS
+    $h2.ForeColor = $script:cGray
+    $gp.Controls.AddRange(@($t2, $h2))
+    $chips = @()
+    if ($cpu.Quiet -gt 0) {
+        $chips += [pscustomobject]@{ MHz = $cpu.Quiet; Name = '조용' }
+        $chips += [pscustomobject]@{ MHz = $cpu.Base; Name = '기본' }
+    }
+    if ($cpu.Game -gt 0) { $chips += [pscustomobject]@{ MHz = $cpu.Game; Name = '게임' } }
+    $script:ChipButtons = @()
+    $x = 12
+    foreach ($c in $chips) {
+        $title = ('{0} {1:0.0}GHz' -f $c.Name, ($c.MHz / 1000))
+        $b = New-Button $title $x 108 140 36 $script:fB
+        $b.Tag = [pscustomobject]@{ MHz = [int]$c.MHz; Title = $title }
+        $b.Add_Click({
+            try { $m = New-ClockMode ([int]$this.Tag.MHz) }
+            catch { Set-Status ('실패: ' + $_.Exception.Message) ([System.Drawing.Color]::Red); return }
+            Invoke-ModeClick $m
+        })
+        $script:ChipButtons += $b
+        $gp.Controls.Add($b)
+        $x += 148
+    }
+    if ($chips.Count -eq 0) {
+        $gp.Controls.Add((New-Label "이 CPU는 빠른 선택 값이 없어요. 아래 '직접 정하기'로 값을 정해 주세요." 12 116 596 22))
+    } else {
+        $hintTxt = '조용: 문서·영상  ·  기본: 기본 클럭까지'
+        if ($cpu.Game -gt 0) { $hintTxt += ('  ·  게임: 부스트 조금만 (원래 {0:0.0}GHz)' -f ($cpu.Boost / 1000)) }
+        $h3 = New-Label $hintTxt 12 148 596 18 $script:fS
+        $h3.ForeColor = $script:cGray
+        $gp.Controls.Add($h3)
+    }
+
+    $l4 = New-Label '직접 정하기' 12 178 84 22
+    $script:tbClock = New-Object System.Windows.Forms.TrackBar
+    $script:tbClock.AutoSize = $false
+    $script:tbClock.Location = New-Object System.Drawing.Point(96, 172)
+    $script:tbClock.Size = New-Object System.Drawing.Size(300, 30)
+    $script:tbClock.TickStyle = 'None'
+    $script:tbClock.Minimum = [int][math]::Ceiling($cpu.Min / 100.0)
+    $script:tbClock.Maximum = [int][math]::Floor($cpu.Max / 100.0)
+    $script:tbClock.SmallChange = 1
+    $script:tbClock.LargeChange = 2
+    $script:tbClock.BackColor = $cBack
+    $script:txtClock = New-Object System.Windows.Forms.TextBox
+    $script:txtClock.Location = New-Object System.Drawing.Point(402, 175)
+    $script:txtClock.Size = New-Object System.Drawing.Size(64, 25)
+    $script:txtClock.Font = $script:fN
+    $script:txtClock.TextAlign = 'Right'
+    $script:txtClock.MaxLength = 7
+    $l5 = New-Label 'MHz' 470 178 38 22
+    $script:btnApply = New-Button '적용' 512 172 96 30 $script:fB
+    # 슬라이더를 움직이면 숫자 칸이 따라가고, 숫자를 적으면(쓸 수 있는 값일 때) 슬라이더가 따라간다
+    $script:tbClock.Add_ValueChanged({
+        if ($script:Syncing) { return }
+        $script:Syncing = $true
+        try { $script:txtClock.Text = "$($script:tbClock.Value * 100)" } catch { } finally { $script:Syncing = $false }
+        try { Update-ApplyButton } catch { }
+    })
+    $script:txtClock.Add_TextChanged({
+        if ($script:Syncing) { return }
+        $script:Syncing = $true
+        try {
+            $n = ConvertTo-ClockValue $script:txtClock.Text
+            if ($null -ne $n) {
+                $t = [int][math]::Round($n / 100.0)
+                $script:tbClock.Value = [math]::Max($script:tbClock.Minimum, [math]::Min($script:tbClock.Maximum, $t))
+            }
+        } catch { } finally { $script:Syncing = $false }
+        try { Update-ApplyButton } catch { }
+    })
+    $script:txtClock.Add_KeyDown({
+        if ($_.KeyCode -eq [System.Windows.Forms.Keys]::Enter) {
+            $_.SuppressKeyPress = $true
+            try { Invoke-CustomApply } catch { try { Set-Status ('실패: ' + $_.Exception.Message) ([System.Drawing.Color]::Red) } catch { } }
         }
     })
-    $gbi.Controls.AddRange(@($bg, $br))
-    $form.Controls.Add($gbi)
+    $script:btnApply.Add_Click({
+        try { Invoke-CustomApply } catch { try { Set-Status ('실패: ' + $_.Exception.Message) ([System.Drawing.Color]::Red) } catch { } }
+    })
+    $gp.Controls.AddRange(@($l4, $script:tbClock, $script:txtClock, $l5, $script:btnApply))
+    $defClock = if ($cpu.Game -gt 0) { $cpu.Game } elseif ($cpu.Base -ge 2000) { $cpu.Base } else { 3000 }
+    Set-ClockControls $defClock
 
-    # 아래 버튼
-    $bc = New-Button '고장 예방 체크리스트' 10 702 200 34
-    $bc.Add_Click({ Show-TextWindow '고장 예방 체크리스트' $Checklist })
-    $bs = New-Button '바탕화면 바로가기 만들기' 220 702 200 34
+    # 원래대로
+    $br0 = New-Button '원래대로 되돌리기' 12 214 190 38 $script:fB
+    $br0.Add_Click({ Invoke-ModeClick 'restore' })
+    $d0 = New-Label "이 프로그램이 만든 전원 계획을 지우고, 쓰던 계획으로 돌아가요." 212 224 396 20 $script:fS
+    $gp.Controls.AddRange(@($br0, $d0))
+    $form.Controls.Add($gp)
+
+    # ----- 아래: 바이오스·안내 -----
+    $lb = New-Label 'W(와트) 전력 제한은 바이오스에서 걸어야 확실해요. 7640HS·H255 모두 35W를 권장해요.' 14 526 614 20 $script:fS
+    $form.Controls.Add($lb)
+    $bg = New-Button '바이오스 설정 방법' 10 548 134 30 $script:fS
+    $bg.Add_Click({
+        try { Show-TextWindow '바이오스 전력 제한 방법' $BiosGuide }
+        catch { Set-Status ('안내 창을 열지 못했어요: ' + $_.Exception.Message) ([System.Drawing.Color]::Red) }
+    })
+    $br = New-Button '바이오스로 재부팅' 149 548 128 30 $script:fS
+    $br.Add_Click({
+        try {
+            $ans = [System.Windows.Forms.MessageBox]::Show("지금 바로 재부팅해서 바이오스로 들어갑니다.`n저장 안 한 작업이 있으면 먼저 저장하세요.`n`n계속할까요?", $AppName, 'YesNo', 'Warning', 'Button2')
+            if ($ans -ne 'Yes') { return }
+            if ($DryRun) { [void][System.Windows.Forms.MessageBox]::Show('[시험 모드] shutdown /r /fw /t 0 을 실행할 차례예요.', $AppName); return }
+            $failed = $false
+            $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+            try { & $ShutdownExe /r /fw /t 0 2>&1 | Out-Null; if ($LASTEXITCODE -ne 0) { $failed = $true } }
+            catch { $failed = $true }
+            finally { $ErrorActionPreference = $old }
+            if ($failed) {
+                [void][System.Windows.Forms.MessageBox]::Show('바이오스로 바로 재부팅하지 못했어요. 컴퓨터를 다시 켤 때 Del 키를 연타하세요.', $AppName)
+            }
+        } catch { Set-Status ('재부팅하지 못했어요: ' + $_.Exception.Message) ([System.Drawing.Color]::Red) }
+    })
+    $bc = New-Button '고장 예방 체크리스트' 282 548 138 30 $script:fS
+    $bc.Add_Click({
+        try { Show-TextWindow '고장 예방 체크리스트' $Checklist }
+        catch { Set-Status ('안내 창을 열지 못했어요: ' + $_.Exception.Message) ([System.Drawing.Color]::Red) }
+    })
+    $bs = New-Button '바탕화면 바로가기' 425 548 126 30 $script:fS
     $bs.Add_Click({
-        try { New-DesktopShortcut; Set-Status "바탕화면에 '$AppName' 바로가기를 만들었어요." ([System.Drawing.Color]::FromArgb(0, 120, 60)) }
+        if ($DryRun) { Set-Status '[시험 모드] 바로가기는 만들지 않았어요.'; return }
+        try { New-DesktopShortcut; Set-Status "바탕화면에 '$AppName' 바로가기를 만들었어요." $script:cGreen }
         catch { Set-Status ('바로가기를 만들지 못했어요: ' + $_.Exception.Message) ([System.Drawing.Color]::Red) }
     })
-    $bd = New-Button '사용법 보기' 430 702 200 34
-    $bd.Add_Click({
-        $readme = Join-Path $AppDir '사용법.txt'
-        if (Test-Path -LiteralPath $readme) { Start-Process notepad.exe -ArgumentList "`"$readme`"" } else { Set-Status '사용법.txt 파일이 같은 폴더에 없어요.' }
+    $script:btnHelp = New-Button '사용법' 556 548 74 30 $script:fS
+    $script:btnHelp.Add_Click({
+        try {
+            $readme = Join-Path $AppDir '사용법.txt'
+            if (Test-Path -LiteralPath $readme) { Start-Process -FilePath $NotepadExe -ArgumentList "`"$readme`"" } else { Set-Status '사용법.txt 파일이 같은 폴더에 없어요.' }
+        } catch { Set-Status ('사용법을 열지 못했어요: ' + $_.Exception.Message) ([System.Drawing.Color]::Red) }
     })
-    $form.Controls.AddRange(@($bc, $bs, $bd))
-    $script:lblStatus = New-Label '' 12 744 616 26 $script:fS
+    $form.Controls.AddRange(@($bg, $br, $bc, $bs, $script:btnHelp))
+    $script:lblStatus = New-Label '' 12 584 618 22 $script:fS
+    $script:lblStatus.AutoEllipsis = $true
     $form.Controls.Add($script:lblStatus)
-    Set-Status "$AppVersion · $Disclaimer" ([System.Drawing.Color]::Gray)
+    Set-Status "$AppVersion · $Disclaimer" $script:cGray
+    # 창이 뜨자마자 Enter·Space 가 눌려도 설정이 바뀌지 않게, 처음 포커스는 '사용법' 버튼에 둔다
+    $form.ActiveControl = $script:btnHelp
 
     # 화면이 작거나 배율이 커서 창이 화면보다 길면, 화면 높이에 맞추고 스크롤로 본다
     $form.Add_Load({
-        $wa = if ($script:FakeWorkArea) { $script:FakeWorkArea } else { [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea }
-        if ($form.Height -gt $wa.Height) {
-            $form.AutoScroll = $true
-            $form.Height = $wa.Height
-            $form.Width = $form.Width + [System.Windows.Forms.SystemInformation]::VerticalScrollBarWidth
-            $form.Location = New-Object System.Drawing.Point(($wa.Left + [math]::Max(0, [int](($wa.Width - $form.Width) / 2))), $wa.Top)
-        }
+        try {
+            $f = $script:form
+            $wa = if ($script:FakeWorkArea) { $script:FakeWorkArea } else { [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea }
+            if ($f.Height -gt $wa.Height) {
+                $f.AutoScroll = $true
+                $f.Height = $wa.Height
+                $f.Width = $f.Width + [System.Windows.Forms.SystemInformation]::VerticalScrollBarWidth
+                $f.Location = New-Object System.Drawing.Point(($wa.Left + [math]::Max(0, [int](($wa.Width - $f.Width) / 2))), $wa.Top)
+            }
+        } catch { }
     })
 
-    Update-StateUI
+    Update-StateUI $true
 
-    $timer = New-Object System.Windows.Forms.Timer
-    $timer.Interval = 1000
-    $timer.Add_Tick({ Update-Live })
+    $script:timer = New-Object System.Windows.Forms.Timer
+    $script:timer.Interval = 1000
+    $script:timer.Add_Tick({ try { Update-Live } catch { } })
+
+    # 스크롤이 생기는 작은 화면에서도 창이 맨 위부터 보이게 한다(처음 포커스가 아래쪽 버튼에 있어서 내려가 있을 수 있다)
+    $form.Add_Shown({ try { if ($script:form.AutoScroll) { $script:form.AutoScrollPosition = New-Object System.Drawing.Point(0, 0) } } catch { } })
 
     if ($Snapshot) {
         $form.StartPosition = 'Manual'
         $form.Location = New-Object System.Drawing.Point(-3000, -3000)
         $form.ShowInTaskbar = $false
         $form.Add_Shown({
-            if ($script:Live) { Update-Live }   # 시험용: 미리 넣어 둔 값으로 화면을 그린다
-            $form.Refresh()
-            $bmp = New-Object System.Drawing.Bitmap($form.Width, $form.Height)
-            $form.DrawToBitmap($bmp, (New-Object System.Drawing.Rectangle(0, 0, $form.Width, $form.Height)))
-            $bmp.Save($Snapshot, [System.Drawing.Imaging.ImageFormat]::Png)
-            $bmp.Dispose()
-            $form.Close()
+            if ($script:TestHook) { & $script:TestHook }   # 시험용: 버튼을 눌러 보는 자동 시험
+            if ($script:Live) { Update-Live }               # 시험용: 미리 넣어 둔 값으로 화면을 그린다
+            Save-WindowImage $Snapshot
+            $script:form.Close()
         })
     } else {
         Start-LiveReader
-        $form.Add_Shown({ $timer.Start() })
+        $form.Add_Shown({ $script:timer.Start() })
+        # 다른 창에 갔다 돌아오면 상태를 다시 읽는다(제어판에서 전원 계획을 바꿨을 수 있으므로)
+        $form.Add_Activated({
+            try { if ([math]::Abs([Environment]::TickCount - $script:LastStateTick) -gt 2000) { Update-StateUI $false } } catch { }
+        })
     }
-    $form.Add_FormClosing({ $timer.Stop(); if ($script:Live) { $script:Live.Stop = $true } })
+    $form.Add_FormClosing({ try { $script:timer.Stop(); if ($script:Live) { $script:Live.Stop = $true } } catch { } })
     try {
         [void]$form.ShowDialog()
     } finally {
-        $timer.Dispose()
+        $script:timer.Dispose()
         Stop-LiveReader
         $form.Dispose()
+        foreach ($o in @($script:brTrack, $script:brFill, $script:brLocked, $script:brTick, $script:brLimitText, $script:penBorder, $script:penLimit)) {
+            try { $o.Dispose() } catch { }
+        }
     }
 }
 
 # ---------- 시작 ----------
 try {
     $script:Cpu = Get-CpuInfo
-    $script:Profiles = Get-Profiles $script:Cpu
     if ($RunAction) {
         "CPU: $($script:Cpu.Name)  ->  $($script:Cpu.Model)"
         switch ($RunAction) {
             'status' {
-                Get-CurrentState | Format-List | Out-String
+                $st = Get-CurrentState
+                $st | Format-List | Out-String
+                "모드: $((Get-StateMode $st).Kind)"
                 $v = & $LiveReader $true
                 "실제 CPU 클럭: $($v.MHz) MHz, 사용률 $($v.Util)%"
                 if (@($v.Disks).Count) { @($v.Disks) | Format-Table -AutoSize | Out-String } else { 'SSD 온도: 읽을 수 없음(관리자 권한 필요)' }
             }
             'restore' { if (-not (Restore-Default)) { '되돌릴 설정이 없어요(이 프로그램 전원 계획 없음).' } }
-            default { Set-Profile $script:Profiles[$RunAction] }
+            default {
+                $cpu = $script:Cpu
+                $mode = $null
+                if ($RunAction -eq 'boostoff' -or $RunAction -eq 'recommend') { $mode = New-BoostOffMode }
+                elseif ($RunAction -eq 'clock') {
+                    if ($Clock -le 0) { throw '-RunAction clock 에는 -Clock <MHz> 를 같이 적어 주세요. 예: -RunAction clock -Clock 4200' }
+                    $mode = New-ClockMode $Clock
+                }
+                else {
+                    # quiet / base / game: 이 CPU에 빠른 선택 값이 있을 때만
+                    $mhz = 0
+                    if ($RunAction -eq 'quiet') { $mhz = $cpu.Quiet }
+                    elseif ($RunAction -eq 'base') { if ($cpu.Quiet -gt 0) { $mhz = $cpu.Base } }
+                    elseif ($RunAction -eq 'game') { $mhz = $cpu.Game }
+                    if ($mhz -le 0) { throw "이 CPU에는 '$RunAction' 값이 정해져 있지 않아요. -RunAction clock -Clock <MHz> 로 직접 정해 주세요." }
+                    $mode = New-ClockMode $mhz
+                }
+                Set-Mode $mode
+                if ($DryRun) { "적용할 설정: $($mode.Title) (시험 모드라 실제로는 바꾸지 않았어요)" } else { "적용: $($mode.Title)" }
+            }
         }
         if ($DryRun -and $RunAction -ne 'status' -and $script:Log.Count -gt 0) { '[DryRun] 실제로 바꾸지 않고, 실행할 명령만 보여줍니다:' }
         $script:Log
